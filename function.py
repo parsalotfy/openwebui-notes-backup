@@ -512,7 +512,7 @@ class Filter:
                 "sha": sha
             }
 
-            response = await client.delete(url, headers=headers, json=data)
+            response = await client.request("DELETE", url, headers=headers, json=data)
 
             if response.status_code == 200:
                 return True
@@ -520,7 +520,7 @@ class Filter:
                 new_sha = await self._github_get_sha(client, token, owner, repo, path)
                 if new_sha:
                     data["sha"] = new_sha
-                    response = await client.delete(url, headers=headers, json=data)
+                    response = await client.request("DELETE", url, headers=headers, json=data)
                     if response.status_code == 200:
                         return True
                 return False
