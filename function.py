@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo, available_timezones
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 try:
     from open_webui.config import DATA_DIR
@@ -77,6 +77,14 @@ class Filter:
         def get_timezones(cls) -> list[str]:
             """Return all available IANA timezone names for the dropdown."""
             return sorted(available_timezones())
+
+        @field_validator("GITHUB_TOKEN", "GITHUB_REPO_OWNER", "GITHUB_REPO_NAME", mode="before")
+        @classmethod
+        def _strip_strings(cls, v):
+            # Valve text fields may pick up stray whitespace/newlines from the
+            # settings UI (e.g. a pasted repo name). Normalise at the source so
+            # API calls never depend on URL scrubbing to stay valid.
+            return v.strip() if isinstance(v, str) else v
 
     def __init__(self):
         self.valves: Filter.Valves = self.Valves()
@@ -203,9 +211,11 @@ class Filter:
     async def _run_backup(self, user_id: str, user_valves: "Filter.UserValves", tz: ZoneInfo) -> None:
         logger.info(f"Note Exporter: backup starting user_id={user_id}")
         try:
-            token = user_valves.GITHUB_TOKEN
-            owner = user_valves.GITHUB_REPO_OWNER
-            repo = user_valves.GITHUB_REPO_NAME
+            # Belt and braces next to the UserValves strip-validator: valve text
+            # fields may carry stray whitespace from the settings UI.
+            token = (user_valves.GITHUB_TOKEN or "").strip()
+            owner = (user_valves.GITHUB_REPO_OWNER or "").strip()
+            repo = (user_valves.GITHUB_REPO_NAME or "").strip()
             delete_removed = user_valves.DELETE_REMOVED_NOTES
 
             client = httpx.AsyncClient()
@@ -218,6 +228,10 @@ class Filter:
 
                 current_hashes: dict[str, str] = {}
                 current_short_ids: set[str] = set()
+                # Every note id present in the DB, parseable or not. The
+                # delete-removed pass must only delete files whose note is
+                # genuinely gone — an unparseable note still owns its file.
+                db_short_ids: set[str] = set()
                 for note in notes:
                     md_content = self._extract_markdown(note.data)
                     if md_content is None:
@@ -225,8 +239,16 @@ class Filter:
                     short_id = note.id[:8]
                     current_hashes[short_id] = hashlib.sha256(md_content.encode("utf-8")).hexdigest()
                     current_short_ids.add(short_id)
+                for note in notes:
+                    db_short_ids.add(note.id[:8])
 
                 listing = await self._github_list_dir(client, token, owner, repo, "")
+                if listing is None:
+                    # A failed directory listing is indistinguishable from an
+                    # empty repo if we proceed with {}: every note would look
+                    # new and be PUT-created (422 on existing files). Abort.
+                    logger.error(f"Note Exporter: backup aborted user_id={user_id}: directory listing failed")
+                    return
                 repo_files: dict[str, GitHubContent] = {}
                 for entry in listing:
                     if entry.type != "file":
@@ -236,13 +258,16 @@ class Filter:
                         continue
                     repo_files[short_id] = entry
 
-                had_failure = False
+                failures: list[str] = []
 
                 for note in notes:
                     note_id = note.id
                     title = note.title or "untitled"
                     md_content = self._extract_markdown(note.data)
                     if md_content is None:
+                        logger.warning(
+                            f"Note Exporter: skipping unparseable note id={note_id} title={title!r}"
+                        )
                         continue
 
                     short_id = note_id[:8]
@@ -255,15 +280,15 @@ class Filter:
                     expected_filename = self._make_filename(note_id, title)
                     repo_entry = repo_files.get(short_id)
                     file_sha = None
+                    old_path: str | None = None
                     if repo_entry:
                         actual_path = repo_entry.path
                         if actual_path != expected_filename:
-                            file_sha = repo_entry.sha
-                            if file_sha:
-                                await self._github_delete(
-                                    client, token, owner, repo, actual_path,
-                                    f"notes: rename {title}", file_sha
-                                )
+                            # Rename: write the new file FIRST and delete the
+                            # old path only after the PUT succeeds. The old
+                            # delete-then-create order left a gap where a
+                            # failed create lost the note until the next run.
+                            old_path = actual_path
                             file_sha = None
                         else:
                             file_sha = repo_entry.sha
@@ -278,21 +303,43 @@ class Filter:
                         md_content, commit_msg, file_sha
                     )
                     if not success:
-                        had_failure = True
+                        failures.append(expected_filename)
+                        continue
+
+                    if old_path is not None:
+                        old_sha = await self._github_get_sha(client, token, owner, repo, old_path)
+                        if old_sha:
+                            deleted = await self._github_delete(
+                                client, token, owner, repo, old_path,
+                                f"notes: rename {title}", old_sha
+                            )
+                            if not deleted:
+                                failures.append(old_path)
+                                continue
+                        repo_files.pop(short_id, None)
+
+                    # Record progress per note so a later failure does not
+                    # force the next run to re-push notes that already landed.
+                    old_hashes[short_id] = NoteHash(
+                        user_id=user_id, short_id=short_id, sha256=content_hash
+                    )
+                    self._save_hashes(user_id, old_hashes)
 
                 if delete_removed:
                     for short_id, entry in repo_files.items():
-                        if short_id in current_short_ids:
+                        if short_id in db_short_ids:
                             continue
                         path = entry.path
                         file_sha = entry.sha
                         if file_sha:
-                            await self._github_delete(
+                            deleted = await self._github_delete(
                                 client, token, owner, repo, path,
                                 "notes: delete removed note", file_sha
                             )
+                            if not deleted:
+                                failures.append(path)
 
-                if not had_failure:
+                if not failures:
                     note_hashes = [
                         NoteHash(user_id=user_id, short_id=sid, sha256=h)
                         for sid, h in current_hashes.items()
@@ -302,6 +349,14 @@ class Filter:
                         note_hashes,
                     )
                     logger.info(f"Note Exporter: backup completed user_id={user_id} notes={len(notes)}")
+                else:
+                    # State intentionally keeps the OLD last_run so the next
+                    # chat activity retries the failed paths (per-note hashes
+                    # above already exclude them from re-push).
+                    logger.warning(
+                        f"Note Exporter: backup finished with failures "
+                        f"user_id={user_id} failed={len(failures)} paths={failures}"
+                    )
 
             finally:
                 await client.aclose()
@@ -348,6 +403,27 @@ class Filter:
                 conn.close()
         except Exception as e:
             logger.warning(f"Note Exporter: failed to save state for {state.user_id}: {e}")
+
+    def _save_hashes(self, user_id: str, hashes: dict[str, NoteHash]) -> None:
+        """Persist per-note hashes without touching last_run.
+
+        Called after each successful PUT so a later failure in the same run
+        does not force the next run to re-push notes that already landed.
+        """
+        try:
+            conn = self._init_state_db()
+            try:
+                conn.execute("DELETE FROM note_hashes WHERE user_id = ?", (user_id,))
+                if hashes:
+                    conn.executemany(
+                        "INSERT INTO note_hashes (user_id, short_id, sha256) VALUES (?, ?, ?)",
+                        [(h.user_id, h.short_id, h.sha256) for h in hashes.values()],
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"Note Exporter: failed to save hashes for {user_id}: {e}")
 
     def _extract_note_id_from_filename(self, name: str) -> str | None:
         m = re.search(r"-([0-9a-f]{8})\.md$", name)
@@ -441,7 +517,9 @@ class Filter:
             return None
         return result.sha
 
-    async def _github_list_dir(self, client, token, owner, repo, path) -> list[GitHubContent]:
+    async def _github_list_dir(self, client, token, owner, repo, path) -> list[GitHubContent] | None:
+        """List directory contents. Returns None (not []) on request failure
+        so callers can abort instead of mistaking failure for an empty repo."""
         try:
             url = self._clean_url(f"https://api.github.com/repos/{owner}/{repo}/contents/{path}")
             headers = {
@@ -450,7 +528,11 @@ class Filter:
             }
             response = await client.get(url, headers=headers)
             if response.status_code != 200:
-                return []
+                logger.warning(
+                    f"Note Exporter: GitHub LIST {path} failed: "
+                    f"status={response.status_code} body={response.text[:500]}"
+                )
+                return None
             data = response.json()
             if not isinstance(data, list):
                 return []
@@ -464,7 +546,7 @@ class Filter:
             return result
         except Exception as e:
             logger.warning(f"Note Exporter: GitHub LIST {path} failed: {e}")
-            return []
+            return None
 
     async def _github_put(self, client, token, owner, repo, path, content, message, sha=None) -> bool:
         try:
@@ -486,15 +568,27 @@ class Filter:
 
             if response.status_code in [200, 201]:
                 return True
-            elif response.status_code == 409:
+            elif response.status_code in (409, 422):
+                # 409: sha conflict. 422: often "sha wasn't supplied" because
+                # the file appeared (or the ref settled) between our listing
+                # and this call — e.g. right after deleting a renamed path.
+                # Re-fetch the sha and retry once with it.
                 new_sha = await self._github_get_sha(client, token, owner, repo, path)
-                if new_sha:
+                if new_sha and new_sha != sha:
                     data["sha"] = new_sha
                     response = await client.put(url, headers=headers, json=data)
                     if response.status_code in [200, 201]:
                         return True
+                logger.warning(
+                    f"Note Exporter: GitHub PUT {path} failed: "
+                    f"status={response.status_code} body={response.text[:500]}"
+                )
                 return False
             else:
+                logger.warning(
+                    f"Note Exporter: GitHub PUT {path} failed: "
+                    f"status={response.status_code} body={response.text[:500]}"
+                )
                 return False
         except Exception as e:
             logger.warning(f"Note Exporter: GitHub PUT {path} failed: {e}")
@@ -516,15 +610,23 @@ class Filter:
 
             if response.status_code == 200:
                 return True
-            elif response.status_code == 409:
+            elif response.status_code in (409, 422):
                 new_sha = await self._github_get_sha(client, token, owner, repo, path)
-                if new_sha:
+                if new_sha and new_sha != sha:
                     data["sha"] = new_sha
                     response = await client.request("DELETE", url, headers=headers, json=data)
                     if response.status_code == 200:
                         return True
+                logger.warning(
+                    f"Note Exporter: GitHub DELETE {path} failed: "
+                    f"status={response.status_code} body={response.text[:500]}"
+                )
                 return False
             else:
+                logger.warning(
+                    f"Note Exporter: GitHub DELETE {path} failed: "
+                    f"status={response.status_code} body={response.text[:500]}"
+                )
                 return False
         except Exception as e:
             logger.warning(f"Note Exporter: GitHub DELETE {path} failed: {e}")
