@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo, available_timezones
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError
 
 try:
     from open_webui.config import DATA_DIR
@@ -77,14 +77,6 @@ class Filter:
         def get_timezones(cls) -> list[str]:
             """Return all available IANA timezone names for the dropdown."""
             return sorted(available_timezones())
-
-        @field_validator("GITHUB_TOKEN", "GITHUB_REPO_OWNER", "GITHUB_REPO_NAME", mode="before")
-        @classmethod
-        def _strip_strings(cls, v):
-            # Valve text fields may pick up stray whitespace/newlines from the
-            # settings UI (e.g. a pasted repo name). Normalise at the source so
-            # API calls never depend on URL scrubbing to stay valid.
-            return v.strip() if isinstance(v, str) else v
 
     def __init__(self):
         self.valves: Filter.Valves = self.Valves()
